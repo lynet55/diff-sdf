@@ -1,0 +1,9 @@
+[project]
+name = "geomk"
+version = "0.1.0"
+description = "Differentiable parametric geometry kernel (signed-implicit, segmented, JAX)"
+requires-python = ">=3.11"
+dependencies = ["jax", "numpy", "scipy"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
