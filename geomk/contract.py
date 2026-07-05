@@ -28,6 +28,20 @@ class FieldContract:
     # Reserved: named (region_i, region_j) interface objects. Deferred.
     interface_identity: Optional[object] = None
 
+    # How absolute physical quantities (mass, volume, com, inertia) are
+    # produced. Default: the soft smoothed-occupancy path (value == gradient
+    # function). With the accurate straddle: hardened supersampled occupancy
+    # for values (theta-staircase, do not finite-difference), soft-path
+    # gradients (stop-gradient straddle).
+    absolute_value_path: str = ("soft smoothed-occupancy integrals (value "
+                                "and gradient are the same differentiable "
+                                "function)")
+
+    # Declared-mate interface pairs (component indices) whose composition is
+    # sharpened to the exact max and whose background is bridged; empty means
+    # composition is everywhere the smooth log-sum-exp path.
+    sharpened_mates: tuple = ()
+
 
 DIFFERENTIABILITY_NOTE = (
     "All projections are C^inf in theta except: box/capsule primitives have "

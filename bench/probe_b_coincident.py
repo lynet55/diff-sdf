@@ -21,17 +21,20 @@ from bench._style import SERIES, SEQ, SURFACE, INK, INK2, GRIDLINE
 from matplotlib.colors import to_rgb
 
 from geomk.dag import GraphBuilder
-from geomk.compose import Component, Assembly, make_region_fields, pou_weights
-from geomk.projections import GridSpec, make_mass_properties
+from geomk.compose import (Component, Assembly, make_region_fields,
+                           make_background_field, pou_weights)
+from geomk.projections import GridSpec, make_mass_properties, BG_BRIDGE_TAUS
 
 HX, HY, HZ = 0.5, 0.3, 0.2      # box half extents
 RHO_A, RHO_B = 2.0, 1.0
 RESULTS = {}
 
 
-def assembly(shift, k):
+def assembly(shift, k, mated=False):
     """A: x in [-1, 0] (precedence 1). B: x in [shift, 1+shift] (precedence 0).
-    shift > 0 gap, = 0 exact-coincident, < 0 overlap (owned by A)."""
+    shift > 0 gap, = 0 exact-coincident, < 0 overlap (owned by A).
+    mated=True declares the A/B interface a mate: exact-max composition for
+    B's higher-precedence contribution + bridged PoU background at the seam."""
     gb = GraphBuilder()
     a = gb.box((-HX, 0, 0), (HX, HY, HZ))
     b = gb.box((HX + shift, 0, 0), (HX, HY, HZ))
@@ -39,7 +42,7 @@ def assembly(shift, k):
     return Assembly(graph, (
         Component("A", a, density=RHO_A, precedence=1),
         Component("B", b, density=RHO_B, precedence=0),
-    ), k_compose=k)
+    ), k_compose=k, mates=((0, 1),) if mated else ())
 
 
 def exact_masses(shift):
@@ -92,12 +95,13 @@ RESULTS["smear"] = b1
 print("B2: mass error vs tau and k (fine grid), vs resolution (tied tau)")
 
 
-def masses(s, tau, k, nx=192):
-    asm = assembly(s, k=k)
+def masses(s, tau, k, nx=192, mated=False, accurate=False, supersample=3):
+    asm = assembly(s, k=k, mated=mated)
     ny = max(12, nx // 8)
     grid = GridSpec(lo=(-1.15, -0.45, -0.35), hi=(1.15 + max(s, 0), 0.45, 0.35),
                     shape=(nx, ny, ny), tau=tau)
-    p = make_mass_properties(asm, grid)(jnp.asarray(asm.graph.theta0))
+    p = make_mass_properties(asm, grid, accurate=accurate,
+                             supersample=supersample)(jnp.asarray(asm.graph.theta0))
     return np.asarray(p["component_mass"])
 
 
@@ -129,6 +133,53 @@ for nx in (24, 48, 96, 192, 384):
     b2r["err_B"].append(float((m[1] - mb_x) / mb_x))
     print(f"  nx={nx:4d} dx={dx:.4f}  errA {b2r['err_A'][-1]:+.4f}  errB {b2r['err_B'][-1]:+.4f}")
 RESULTS["mass_vs_resolution"] = b2r
+
+# ---------- B3: declared mate (A,B) — the fix, gated ---------------------------
+print("B3: declared mate — coincident-case gates (k=0.08)")
+TAU_LINE = 0.03
+ma_x, mb_x = exact_masses(0.0)
+
+# (i) lower-precedence (B) mass error at the finest baseline setting
+# (nx=384, tau=1.5dx): accurate straddle path (hardened supersampled
+# occupancy values) and the soft mated path alongside.
+nx_g = 384
+dx_g = 2.3 / nx_g
+m_acc = masses(0.0, 1.5 * dx_g, 0.08, nx=nx_g, mated=True,
+               accurate=True, supersample=2)
+m_soft = masses(0.0, 1.5 * dx_g, 0.08, nx=nx_g, mated=True)
+errB_acc = float((m_acc[1] - mb_x) / mb_x)
+errA_acc = float((m_acc[0] - ma_x) / ma_x)
+errB_soft = float((m_soft[1] - mb_x) / mb_x)
+baseline_errB = b2r["err_B"][b2r["nx"].index(nx_g)]
+print(f"  errB accurate path {errB_acc:+.5f}  (soft mated {errB_soft:+.5f}, "
+      f"unmated baseline {baseline_errB:+.5f})")
+
+# (ii) max background (void) weight along the mating normal, mated
+# composition + bridged background, vs the unmated baseline at the same tau.
+asm_m = assembly(0.0, k=0.08, mated=True)
+theta_m = jnp.asarray(asm_m.graph.theta0)
+phi_m = make_region_fields(asm_m)(theta_m, jnp.asarray(line))
+phi_bg = make_background_field(asm_m)(theta_m, jnp.asarray(line),
+                                      BG_BRIDGE_TAUS * TAU_LINE)
+_, wbg_m = pou_weights(phi_m, TAU_LINE, phi_bg)
+ridge_mated = float(np.asarray(wbg_m).max())
+ridge_unmated = float(np.asarray(profiles["coincident 0"][1]).max())
+print(f"  void ridge max w_bg {ridge_mated:.4f}  (unmated baseline "
+      f"{ridge_unmated:.4f}, tau={TAU_LINE})")
+
+RESULTS["mate_gates"] = {
+    "coincident_errB_accurate_path": errB_acc,
+    "coincident_errA_accurate_path": errA_acc,
+    "coincident_errB_soft_mated": errB_soft,
+    "coincident_errB_unmated_baseline": float(baseline_errB),
+    "mating_plane_max_background_weight": ridge_mated,
+    "mating_plane_max_background_weight_unmated_baseline": ridge_unmated,
+    "settings": {"nx": nx_g, "tau_mass": 1.5 * dx_g, "k": 0.08,
+                 "supersample": 2, "tau_line": TAU_LINE,
+                 "k_bridge": BG_BRIDGE_TAUS * TAU_LINE},
+}
+assert abs(errB_acc) <= 0.01, f"gate: |errB| accurate path {errB_acc}"
+assert ridge_mated <= 0.05, f"gate: void ridge {ridge_mated}"
 
 # ---------- plots -------------------------------------------------------------
 fig = plt.figure(figsize=(11.5, 10.0))

@@ -59,6 +59,30 @@ def _shell(gb):
     return gb.shell(_sphere(gb), 0.2)
 
 
+def _revolve(gb):
+    # torus-like: disk profile centered off-axis, revolved about x
+    return gb.revolve(gb.sphere((0.1, 0.8, 0.0), 0.3))
+
+
+def _extrude(gb):
+    # profile = the sphere's z=0 slice (center z != 0 so its grad is nonzero)
+    return gb.extrude(gb.sphere((0.1, -0.2, 0.3), 0.6), 0.5)
+
+
+def _loft(gb):
+    return gb.loft(gb.sphere((0.0, 0.0, 0.0), 0.55),
+                   gb.sphere((0.2, 0.1, 0.0), 0.35), 0.6)
+
+
+def _lattice(gb):
+    return gb.lattice(0.8, 0.18)
+
+
+def _shell_of_extrude(gb):
+    # clean-preserving extrude feeds a require_clean op without redistance
+    return gb.shell(gb.extrude(gb.sphere((0.0, 0.1, 0.2), 0.6), 0.5), 0.1)
+
+
 CASES = {
     "sphere": _sphere,
     "box": _box,
@@ -70,6 +94,11 @@ CASES = {
     "redistance": _redistance,
     "offset": _offset,
     "shell": _shell,
+    "revolve": _revolve,
+    "extrude": _extrude,
+    "loft": _loft,
+    "lattice": _lattice,
+    "shell_of_extrude": _shell_of_extrude,
 }
 
 

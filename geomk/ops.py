@@ -62,6 +62,24 @@ def _capsule(p, q):
     return _safe_norm(ap - t[..., None] * ab) - r
 
 
+def _lattice(p, q):
+    """Infinite axis-aligned strut lattice: cell size c, strut radius t.
+    Fold space into the unit cell and take the min distance to the three
+    strut families (infinite cylinders along x/y/z through the cell center).
+    Approximately metric inside a cell but NOT across cell boundaries (the
+    fold discards farther periodic copies' interiors), so metric is 'dirty' —
+    it is a signed-implicit generator, not an offsettable distance field.
+    A finite lattice = compose this with a domain shape (invariant 5 /
+    smooth_subtract); no clean child is consumed, so require_clean does not
+    apply — the op simply never CLAIMS metric (invariant 3)."""
+    c, t = q[0], q[1]
+    pf = p - c * jnp.round(p / c)
+    dist_x = _safe_norm(pf[..., 1:3]) - t
+    dist_y = _safe_norm(pf[..., ::2]) - t
+    dist_z = _safe_norm(pf[..., :2]) - t
+    return jnp.minimum(dist_x, jnp.minimum(dist_y, dist_z))
+
+
 # --- smooth booleans (log-sum-exp; C-infinity, metric dirty) ----------------
 
 def smin(vals, k):
@@ -99,6 +117,17 @@ def _rigid(p, q):
     return _rotate_vec(p - t, -rotvec)
 
 
+def _revolve(p, q):
+    """Point map: revolve the child 2D profile about the x-axis (fixed axis;
+    reorient the result with rigid()). The profile lives in the (x, y) plane
+    with y the radial coordinate: p = (x, y, z) -> (x, sqrt(y^2 + z^2), 0).
+    The nearest surface point of a revolved 2D SDF stays in the meridian
+    half-plane, so a metric-clean profile yields a metric-clean solid
+    ('preserve'). _safe_norm keeps the gradient finite on the axis r = 0."""
+    r = _safe_norm(p[..., 1:3])
+    return jnp.stack([p[..., 0], r, jnp.zeros_like(r)], axis=-1)
+
+
 # --- metric-sensitive unary ops (Pass 2; require a clean child) -------------
 
 def _offset(d, q):
@@ -113,10 +142,18 @@ OPS = {
     "sphere": OpSpec("primitive", "fffp", _sphere, "clean"),
     "box": OpSpec("primitive", "fffppp", _box, "clean"),
     "capsule": OpSpec("primitive", "ffffffp", _capsule, "clean"),
+    "lattice": OpSpec("primitive", "pp", _lattice, "dirty"),
     "smooth_union": OpSpec("combine", "p", _smooth_union, "dirty"),
     "smooth_subtract": OpSpec("combine", "p", _smooth_subtract, "dirty"),
     "rigid": OpSpec("warp", "ffffff", _rigid, "preserve"),
+    "revolve": OpSpec("warp", "", _revolve, "preserve"),
     "offset": OpSpec("unary", "f", _offset, "require_clean"),
     "shell": OpSpec("unary", "p", _shell, "require_clean"),
     "redistance": OpSpec("special", "", None, "clean"),
+    # extrude/loft evaluate their children at (x, y, 0) and cap in z: special.
+    # Extrude of an exact 2D SDF is the exact 3D SDF -> 'preserve'.
+    # Loft's linear blend of two profiles is sign-correct but not metric
+    # (distance shrinks under the blend) -> 'dirty', honest per invariant 3.
+    "extrude": OpSpec("special", "p", None, "preserve"),
+    "loft": OpSpec("special", "p", None, "dirty"),
 }

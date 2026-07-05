@@ -86,6 +86,22 @@ class GraphBuilder:
     def rigid(self, child, translation=(0.0, 0.0, 0.0), rotvec=(0.0, 0.0, 0.0)):
         return self._add("rigid", (child,), [*translation, *rotvec])
 
+    # profile ops (Pass 4 breadth). Profiles are the child's z=0 slice in the
+    # (x, y) plane; revolve's axis is fixed to x (y = radial coordinate) —
+    # reorient the solid with rigid().
+    def revolve(self, profile):
+        return self._add("revolve", (profile,), [])
+
+    def extrude(self, profile, half_height):
+        return self._add("extrude", (profile,), [half_height])
+
+    def loft(self, profile0, profile1, half_height):
+        return self._add("loft", (profile0, profile1), [half_height])
+
+    # generators
+    def lattice(self, cell, strut_radius):
+        return self._add("lattice", (), [cell, strut_radius])
+
     # metric ops (Pass 2) — construction-time refusal of non-metric children
     def redistance(self, child):
         return self._add("redistance", (child,), [])

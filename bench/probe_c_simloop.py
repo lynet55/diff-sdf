@@ -72,16 +72,18 @@ def build():
 
 
 asm, emap, (ZL, ZB) = build()
-# Sub-voxel grid shift (probe finding): a grid symmetric about the same planes
-# as the geometry places quadrature nodes exactly on the box SDF's max/abs tie
-# sets (x = ±y diagonals). The kinks are measure-zero in space, but a symmetric
-# grid samples them with nonzero measure and AD subgradients then disagree with
-# central FD by ~1e-2. Shifted grid: agreement returns to ~1e-10.
-EPS = 0.00317
-GRID = GridSpec(lo=(-0.28 + EPS, -0.28 + 2.1 * EPS, -0.09 + 0.7 * EPS),
-                hi=(0.28 + EPS, 0.28 + 2.1 * EPS, 0.09 + 0.7 * EPS),
+# Plain symmetric bounds: GridSpec's default deterministic sub-voxel jitter
+# (promoted from this probe's original hand-coded EPS shift) keeps quadrature
+# nodes off the box SDF's max/abs tie sets (x = ±y diagonals), where AD
+# subgradients would otherwise disagree with central FD by ~1e-2.
+GRID = GridSpec(lo=(-0.28, -0.28, -0.09), hi=(0.28, 0.28, 0.09),
                 shape=(56, 56, 18))
-props_fn = make_mass_properties(asm, GRID)
+# Accurate straddle (LOCKED: value accurate, gradient smooth): the rollout's
+# physical constants (m, I, com) VALUES come from hardened supersampled
+# occupancy (~2.41 kg, vs ~5.75 kg for the tau-inflated soft values); their
+# GRADIENTS stay exactly the soft partition-of-unity path via stop_gradient.
+props_fn = make_mass_properties(asm, GRID, accurate=True)
+props_soft_fn = make_mass_properties(asm, GRID)
 
 # ---------- quadrotor dynamics + geometric PD controller ---------------------
 G = 9.81
@@ -110,10 +112,10 @@ def quat_mul(a, b):
         w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2])
 
 
-def make_rollout(z):
+def make_rollout(z, props=None):
     """Physical quantities from geometry(z), then a scanned RK4 rollout."""
     theta = emap.theta(z)
-    p = props_fn(theta)
+    p = (props_fn if props is None else props)(theta)
     m, I, com = p["total_mass"], p["inertia"], p["com"]
     I_inv = jnp.linalg.inv(I)
     L = z[ZL]
@@ -189,7 +191,6 @@ def cost(z):
 # ---------- C1: end-to-end gradient, verified against FD ---------------------
 print("C1: end-to-end gradient check")
 z0 = jnp.asarray(emap.z0)
-cost_j = jax.jit(cost)
 vg = jax.jit(jax.value_and_grad(cost))
 t0 = time.perf_counter()
 J0, g0 = vg(z0)
@@ -200,19 +201,49 @@ vg(z0)[0].block_until_ready()
 t_eval = time.perf_counter() - t0
 
 m0, I0, com0 = [np.asarray(v) for v in jax.jit(lambda z: make_rollout(z)[2])(z0)]
-print(f"  mass {m0:.4f} kg  Ixx {I0[0,0]:.3e}  cost {J0:.5f}")
+print(f"  mass {m0:.4f} kg (accurate straddle)  Ixx {I0[0,0]:.3e}  cost {J0:.5f}")
 print(f"  grad {g0}   (compile {t_compile:.1f}s, eval+grad {t_eval*1e3:.0f}ms)")
+
+# The straddled cost's VALUE is a theta-staircase (hardened occupancy), so it
+# must not be finite-differenced. The FD reference is the soft-path cost
+# variant: m/I/com follow the SOFT projection in theta, anchored at the
+# accurate values at z0 (p_acc(z0) + p_soft(z) - p_soft(z0)) so its rollout
+# linearizes at the same physical constants the straddled rollout uses. At z0
+# its value and its gradient equal the straddled cost's exactly (that is what
+# the stop-gradient straddle means), and it is smooth, so central FD applies.
+P_ACC0 = jax.jit(props_fn)(emap.theta(z0))       # accurate values at z0
+P_SOFT0 = jax.jit(props_soft_fn)(emap.theta(z0))
+
+
+def props_soft_path(theta):
+    s = props_soft_fn(theta)
+    return {key: P_ACC0[key] + (s[key] - P_SOFT0[key]) for key in s}
+
+
+def cost_soft_path(z):
+    return make_rollout(z, props_soft_path)[0]
+
+
+cost_soft_j = jax.jit(cost_soft_path)
+g_soft = np.asarray(jax.jit(jax.grad(cost_soft_path))(z0))
+assert np.allclose(g0, g_soft, rtol=1e-12, atol=1e-15), \
+    f"straddled grad != soft-path grad: {g0} vs {g_soft}"
 
 fd = np.zeros_like(g0)
 h = 1e-5
 for k in range(z0.size):
-    fd[k] = float((cost_j(z0.at[k].add(h)) - cost_j(z0.at[k].add(-h))) / (2 * h))
+    fd[k] = float((cost_soft_j(z0.at[k].add(h))
+                   - cost_soft_j(z0.at[k].add(-h))) / (2 * h))
 rel = np.abs(g0 - fd) / np.maximum(np.abs(fd), 1e-12)
-print(f"  FD   {fd}   rel err {rel}")
-assert np.all(np.isfinite(g0)) and np.all(rel < 1e-4), "gradient check failed"
+print(f"  FD(soft-path cost) {fd}   rel err {rel}")
+assert np.all(np.isfinite(g0)) and np.all(rel < 1e-6), "gradient check failed"
+assert 2.29 <= float(m0) <= 2.53, f"accurate mass {m0} outside [2.29, 2.53] kg"
 RESULTS["gradcheck"] = {"names": list(emap.names), "ad": g0.tolist(),
-                        "fd": fd.tolist(), "rel_err": rel.tolist(),
-                        "cost0": J0, "mass0": float(m0),
+                        "ad_soft_path": g_soft.tolist(),
+                        "fd_soft_path": fd.tolist(), "rel_err": rel.tolist(),
+                        "cost0": J0, "mass0_accurate": float(m0),
+                        "mass0": float(m0),
+                        "mass0_soft": float(np.asarray(P_SOFT0["total_mass"])),
                         "compile_s": t_compile, "eval_grad_ms": t_eval * 1e3}
 
 # ---------- C2: optimize geometry through the sim loop ------------------------

@@ -10,11 +10,8 @@ import jax.numpy as jnp
 import numpy as np
 from scipy import ndimage
 
-from .compose import Assembly, make_region_fields
-from .dag import _nid
-from .evaluate import eval_node
-from .projections import GridSpec
-from .reparam import constrain
+from .compose import Assembly
+from .projections import GridSpec, make_hard_ownership
 
 
 def hard_labels(asm: Assembly, theta, grid: GridSpec):
@@ -26,14 +23,10 @@ def hard_labels(asm: Assembly, theta, grid: GridSpec):
     regions by O(k) near an interface — enough to open a spurious sub-voxel
     background gap that makes hard connectivity flicker under theta.
     Ownership among solid voxels is argmin of the composed fields.
+    (Kernel shared with the accurate-value mass-properties path.)
     """
-    pts = grid.points()
-    phi = np.asarray(make_region_fields(asm)(theta, pts))
-    q = constrain(theta, asm.graph.positive_mask)
-    d = np.stack([np.asarray(eval_node(asm.graph, _nid(c.root), q, jnp.asarray(pts)))
-                  for c in asm.components])
-    labels = np.argmin(phi, axis=0)
-    labels[d.min(axis=0) > 0.0] = -1
+    owner, solid = make_hard_ownership(asm)(theta, jnp.asarray(grid.points()))
+    labels = np.where(np.asarray(solid), np.asarray(owner), -1)
     return labels.reshape(grid.shape)
 
 
