@@ -169,6 +169,110 @@ def make_mass_properties(asm: Assembly, grid: GridSpec,
     return props
 
 
+def make_occupancy(asm: Assembly, grid: GridSpec, components=None,
+                   accurate: bool = False, supersample: int = 3,
+                   mode: str = "partition", soft_supersample: int = 1):
+    """Per-cell occupancy of a subset of components, as a field.
+
+    mode="partition" (default): the components' share of the partition of
+    unity — matter. Shares compete in the softmax, sum to <= 1 across all
+    components, and are the right integrand for material fields (mass,
+    stiffness). mode="indicator": smoothed membership predicate of the
+    selected regions, sigmoid(-phi/tau) of the precedence-composed field —
+    the right object for boundary-condition predicates (clamped region,
+    loaded region), because a predicate must not be eroded when another
+    component's halo competes for the same cells. Indicator occupancies of
+    overlapping selections double-count; they are predicates, not matter.
+    (Second-consumer finding: rigid-body needed neither; FEM needed both.)
+
+    soft_supersample: quadrature order of the SOFT path — s^3 subcell samples
+    averaged per cell (same deterministic jittered lattice the accurate path
+    uses). Default 1 is the mass projection's midpoint rule. Note from the
+    second-consumer probe: refining soft quadrature does NOT repair the
+    stop-gradient straddle's direction error under nonlinear consumers (the
+    straddle applies soft sensitivities at the hard state's Jacobian, exact
+    for linear integrands, direction-unreliable for K^-1-type functionals —
+    measured in bench/probe_f); such consumers should optimize on the pure
+    soft path and report accurate values at anchors.
+
+    The same disciplined sampling as make_mass_properties — same GridSpec
+    cells and jitter, same PoU weights (mate-aware background), same hardened
+    supersampled ownership and stop-gradient straddle — but exposed *before*
+    integration, for volumetric consumers that need the indicator itself
+    (immersed/fictitious-domain FEM uses it as the material field). Added for
+    the second-consumer probe: rigid-body consumed only integrated moments;
+    this is the one thing a field-consuming simulator needed that mass
+    properties did not expose.
+
+    components: iterable of component indices (default: all). Selection is by
+    index; mapping intent tags to indices is the consumer's business — intent
+    stays inert inside the kernel (invariant 6).
+
+    Returns occ(theta) -> (N,) cell occupancies in grid cell order.
+    accurate=True: values are hardened supersampled per-cell volume fractions
+    (quantized to 1/supersample^3 — a theta-staircase, do not finite-
+    difference); gradients are the soft partition-of-unity gradients via the
+    stop-gradient straddle. accurate=False: pure soft path, value == gradient
+    function.
+    """
+    if mode not in ("partition", "indicator"):
+        raise ValueError(f"unknown occupancy mode {mode!r}")
+    sel = np.arange(len(asm.components)) if components is None \
+        else np.asarray(list(components), dtype=int)
+    region_fields = make_region_fields(asm)
+    background = make_background_field(asm) if asm.mates else None
+    ss = int(soft_supersample)
+    pts = jnp.asarray(grid.points(ss))
+    tau = grid.tau
+    sel_j = jnp.asarray(sel)
+
+    def _cell_mean(vals):
+        if ss == 1:
+            return vals
+        n0, n1, n2 = grid.shape
+        return vals.reshape(n0, ss, n1, ss, n2, ss).mean(
+            axis=(1, 3, 5)).reshape(-1)
+
+    def _phi_min(theta, points):
+        phi = region_fields(theta, points)[sel_j]
+        return jnp.min(phi, axis=0) if sel.size > 1 else phi[0]
+
+    def soft_occ(theta):
+        if mode == "indicator":
+            return _cell_mean(jax.nn.sigmoid(-_phi_min(theta, pts) / tau))
+        phi = region_fields(theta, pts)
+        phi_bg = background(theta, pts, BG_BRIDGE_TAUS * tau) \
+            if background is not None else None
+        w, _ = pou_weights(phi, tau, phi_bg)
+        return _cell_mean(jnp.sum(w[sel_j], axis=0))
+
+    if not accurate:
+        return soft_occ
+
+    ownership = make_hard_ownership(asm)
+    s = int(supersample)
+    pts_ss = jnp.asarray(grid.points(s))
+    n0, n1, n2 = grid.shape
+
+    def hard_occ(theta):
+        if mode == "indicator":
+            inside = (_phi_min(theta, pts_ss) <= 0.0).astype(pts_ss.dtype)
+        else:
+            owner, solid = ownership(theta, pts_ss)
+            inside = (jnp.any(owner[None, :] == sel_j[:, None], axis=0)
+                      & solid).astype(pts_ss.dtype)
+        # subsample index along each axis is minor within its coarse cell
+        cells = inside.reshape(n0, s, n1, s, n2, s)
+        return cells.mean(axis=(1, 3, 5)).reshape(-1)
+
+    def occ(theta):
+        soft = soft_occ(theta)
+        hard = jax.lax.stop_gradient(hard_occ(theta))
+        return hard + (soft - jax.lax.stop_gradient(soft))
+
+    return occ
+
+
 def make_contract(asm: Assembly, grid: GridSpec, topology_stamp: int,
                   accurate: bool = False, supersample: int = 3) -> FieldContract:
     clean = all(metric_clean(asm.graph, c.root) for c in asm.components)
