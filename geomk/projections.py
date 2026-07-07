@@ -102,8 +102,27 @@ def make_hard_ownership(asm: Assembly):
     return ownership
 
 
+def _resolve_fidelity(fidelity, accurate):
+    """Explicit consumer-facing fidelity spelling (second-consumer probe):
+    'soft'      — value == gradient function; the right OPTIMIZATION surface
+                  for nonlinear functionals of the field (immersed FEM
+                  compliance), whose straddled gradient can oppose the true
+                  trend. Report accurate values at anchors separately.
+    'straddle'  — hardened supersampled values, soft-path gradients; exact
+                  for (near-)linear integrands (mass/inertia/COM consumers
+                  such as rigid-body plants). Values are theta-staircases:
+                  never finite-difference them.
+    None falls back to the boolean `accurate` flag (compatibility)."""
+    if fidelity is None:
+        return bool(accurate)
+    if fidelity not in ("soft", "straddle"):
+        raise ValueError(f"fidelity must be 'soft' or 'straddle', got {fidelity!r}")
+    return fidelity == "straddle"
+
+
 def make_mass_properties(asm: Assembly, grid: GridSpec,
-                         accurate: bool = False, supersample: int = 3):
+                         accurate: bool = False, supersample: int = 3,
+                         fidelity: str = None):
     """Returns props(theta) -> dict with per-component mass, total mass, com,
     total inertia tensor (about the com), and per-region volumes.
 
@@ -114,7 +133,11 @@ def make_mass_properties(asm: Assembly, grid: GridSpec,
     module docstring); gradients stay exactly the soft-path gradients via the
     stop-gradient straddle. Values are then theta-staircases: do not finite-
     difference them, and do not expect value == its own gradient's potential.
+
+    fidelity ('soft' | 'straddle') is the preferred explicit spelling of the
+    same choice — see _resolve_fidelity for which consumer class needs which.
     """
+    accurate = _resolve_fidelity(fidelity, accurate)
     region_fields = make_region_fields(asm)
     pts = jnp.asarray(grid.points())
     rho = asm.densities
@@ -171,8 +194,13 @@ def make_mass_properties(asm: Assembly, grid: GridSpec,
 
 def make_occupancy(asm: Assembly, grid: GridSpec, components=None,
                    accurate: bool = False, supersample: int = 3,
-                   mode: str = "partition", soft_supersample: int = 1):
+                   mode: str = "partition", soft_supersample: int = 1,
+                   fidelity: str = None):
     """Per-cell occupancy of a subset of components, as a field.
+
+    fidelity ('soft' | 'straddle') is the preferred explicit spelling of the
+    accurate flag — see _resolve_fidelity for which consumer class needs
+    which path.
 
     mode="partition" (default): the components' share of the partition of
     unity — matter. Shares compete in the softmax, sum to <= 1 across all
@@ -215,6 +243,7 @@ def make_occupancy(asm: Assembly, grid: GridSpec, components=None,
     stop-gradient straddle. accurate=False: pure soft path, value == gradient
     function.
     """
+    accurate = _resolve_fidelity(fidelity, accurate)
     if mode not in ("partition", "indicator"):
         raise ValueError(f"unknown occupancy mode {mode!r}")
     sel = np.arange(len(asm.components)) if components is None \
@@ -271,6 +300,149 @@ def make_occupancy(asm: Assembly, grid: GridSpec, components=None,
         return hard + (soft - jax.lax.stop_gradient(soft))
 
     return occ
+
+
+def make_surface_measure(asm: Assembly, grid: GridSpec):
+    """Surface quantities WITHOUT a boundary mesh (co-area formula).
+
+    The solid occupancy 1 - w_bg is a smoothed indicator whose spatial
+    gradient concentrates in a tau-band around the EXTERIOR surface — the
+    partition of unity sums to ~1 across internal component interfaces, so
+    those contribute (almost) nothing: |grad(1 - w_bg)| dV is wetted-surface
+    measure for free, on the same grid/jitter/PoU discipline as every other
+    projection. Third consumer class probed: moments (rigid body), fields
+    (FEM), and now surfaces (aero proxies) — added so a drag-type objective
+    can be tried BEFORE promoting the deferred FlexiCubes / interface-
+    identity items; whether this measure suffices is the probe's question.
+
+    Returns surf(theta, direction=None) -> dict:
+      'wetted_area'    : ∫ |grad_x occ| dV — total exterior area (soft;
+                         carries the same tau-band bias family as volumes:
+                         O(tau * mean curvature) + thin-feature inflation —
+                         heed the resolution diagnostics);
+      'projected_area' : only if direction is given — (3,) or (k, 3) rows —
+                         ∫ max(0, grad_x occ · d̂) dV per direction, the
+                         front-facing silhouette integral (counts overlapping
+                         front-facing patches once each; exact projected area
+                         for convex bodies, an upper bound otherwise — the
+                         standard drag-reference-area proxy); scalar for one
+                         direction, (k,) for several (one gradient pass).
+                         Measured (probe G, quadrotor): non-occluding views
+                         carry only the tau-band bias (+9% at tau=0.011,
+                         shrinking with tau), but occluding views over-count
+                         structurally (+53% along the axis where hubs hide
+                         hubs) — occlusion is NON-LOCAL and no local surface
+                         measure can fix it; an objective needing occlusion-
+                         corrected areas is the genuine trigger for the
+                         deferred mesh/interface-identity work;
+      'surface_density': (N,) per-cell |grad_x occ| for visualization.
+
+    Per-component splits are deliberately NOT offered: attributing shared
+    surface to components is interface identity, which stays deferred.
+    Differentiable in theta end-to-end (grad_x is computed by autodiff at
+    the sample points; theta-gradients flow through it as second-order).
+    """
+    region_fields = make_region_fields(asm)
+    background = make_background_field(asm) if asm.mates else None
+    pts = jnp.asarray(grid.points())
+    tau = grid.tau
+
+    def occupancy_at(theta, point):
+        """Solid occupancy 1 - w_bg at a single point (3,) — scalar."""
+        phi = region_fields(theta, point)                    # (n_regions,)
+        bg = -background(theta, point, BG_BRIDGE_TAUS * tau) / tau \
+            if background is not None else 0.0
+        logits = jnp.concatenate([-phi / tau, jnp.atleast_1d(bg)])
+        m = jnp.max(logits)
+        e = jnp.exp(logits - m)
+        return 1.0 - e[-1] / jnp.sum(e)
+
+    def surf(theta, direction=None):
+        g = jax.vmap(jax.grad(lambda p: occupancy_at(theta, p)))(pts)
+        density = jnp.linalg.norm(g, axis=-1)
+        out = {
+            "wetted_area": jnp.sum(density) * grid.dV,
+            "surface_density": density,
+        }
+        if direction is not None:
+            d = jnp.atleast_2d(jnp.asarray(direction, dtype=g.dtype))
+            d = d / jnp.linalg.norm(d, axis=-1, keepdims=True)
+            proj = jnp.sum(jnp.maximum(g @ d.T, 0.0), axis=0) * grid.dV
+            out["projected_area"] = proj[0] if jnp.ndim(direction) == 1 \
+                else proj
+        return out
+
+    return surf
+
+
+# Saturation threshold of the resolution rule: at a slab's midplane the soft
+# partition weight is ~sigmoid(t/tau), so probe A's "trustworthy at t >= 2*tau"
+# maps to saturation >= sigmoid(2) ~ 0.88.
+TRUST_SATURATION = 0.88
+
+
+def make_resolution_diagnostics(asm: Assembly, grid: GridSpec,
+                                supersample: int = 3,
+                                include_inflation: bool = True):
+    """Differentiable resolution diagnostics (CLAUDE.md: report validity as
+    differentiable diagnostics; never pretend to be a feasible-set oracle).
+
+    Probe A's measured rule: a feature of half-thickness t is trustworthy at
+    t >= 2*tau (recovered-thickness error <= 6%); below that, soft values
+    inflate toward the 2*tau*ln2 floor and hardened responses become
+    hypersensitive (probe E: 25x compliance change from a 5e-5 m move; probe
+    F: an optimizer walked an arm radius through the floor unchecked). This
+    projection turns the rule into a per-component signal:
+
+      saturation: (n_components,) max soft PoU weight over cells. A resolved
+          solid saturates to ~1; a component whose thinnest dimension is
+          2*tau reads ~TRUST_SATURATION (0.88). Differentiable in theta
+          (subgradient at argmax ties), so an optimizer can subscribe, e.g.
+          penalty = softplus((TRUST_SATURATION - saturation) / 0.02).
+      inflation: (n_components,) soft volume / hardened supersampled volume.
+          A COMPARATIVE signal: even resolved bodies carry an edge/corner
+          halo baseline of 1 + O(tau^2 * edge length / V) (measured ~1.17
+          for a chunky box at tau = 0.03); a sub-floor feature jumps well
+          past 2. Value-only: the denominator is a theta-staircase and is
+          stop-gradiented (do not use as a loss term; use saturation).
+
+    Returns diag(theta) -> {'saturation', 'inflation', 'tau',
+                            'trust_threshold'}.
+
+    include_inflation=False skips the hardened supersampled pass (the
+    expensive, value-only half) — the cheap configuration for an optimizer
+    subscribing to the saturation barrier every step.
+    """
+    region_fields = make_region_fields(asm)
+    background = make_background_field(asm) if asm.mates else None
+    ownership = make_hard_ownership(asm) if include_inflation else None
+    pts = jnp.asarray(grid.points())
+    s = int(supersample)
+    pts_ss = jnp.asarray(grid.points(s)) if include_inflation else None
+    tau = grid.tau
+    ids = jnp.arange(len(asm.components))
+
+    def diag(theta):
+        phi = region_fields(theta, pts)
+        phi_bg = background(theta, pts, BG_BRIDGE_TAUS * tau) \
+            if background is not None else None
+        w, _ = pou_weights(phi, tau, phi_bg)
+        out = {
+            "saturation": jnp.max(w, axis=1),
+            "tau": tau,
+            "trust_threshold": TRUST_SATURATION,
+        }
+        if include_inflation:
+            v_soft = jnp.sum(w, axis=1) * grid.dV
+            owner, solid = ownership(theta, pts_ss)
+            occ = ((owner[None, :] == ids[:, None]) & solid[None, :]
+                   ).astype(pts_ss.dtype)
+            v_hard = jax.lax.stop_gradient(
+                jnp.sum(occ, axis=1) * grid.dV / s ** 3)
+            out["inflation"] = v_soft / jnp.maximum(v_hard, 1e-12)
+        return out
+
+    return diag
 
 
 def make_contract(asm: Assembly, grid: GridSpec, topology_stamp: int,

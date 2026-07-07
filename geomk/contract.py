@@ -42,6 +42,34 @@ class FieldContract:
     # composition is everywhere the smooth log-sum-exp path.
     sharpened_mates: tuple = ()
 
+    # --- obligations surfaced by the second-consumer (FEM) probe ------------
+
+    # What the smoothed occupancy's bandwidth is calibrated FOR. The tau-halo
+    # and exponential tails average out under linear integrands but act as
+    # parasitic material to nonlinear / large-coefficient consumers.
+    occupancy_semantics: str = (
+        "partition-of-unity occupancy with bandwidth tau is calibrated for "
+        "LINEAR integrands (mass, volume, inertia): halo and tail errors "
+        "cancel under summation. Nonlinear or large-coefficient consumers "
+        "(compliance, penalty boundary conditions) must size coefficients "
+        "against member scales, use mode='indicator' for region predicates, "
+        "and heed the resolution diagnostics.")
+
+    # Scope of the accurate-value stop-gradient straddle.
+    straddle_scope: str = (
+        "exact for (near-)linear integrands; under nonlinear functionals the "
+        "straddled gradient (soft sensitivities at the hard state's "
+        "Jacobian) can oppose the true trend — such consumers optimize with "
+        "fidelity='soft' and report accurate values at anchors.")
+
+    # The measured resolution trust rule (probe A), machine-checkable via
+    # make_resolution_diagnostics.
+    resolution_rule: str = (
+        "features are trustworthy at thickness >= 2*tau (saturation "
+        "diagnostic >= 0.88); below the floor, soft values inflate toward "
+        "the 2*tau*ln2 recovered-thickness floor and hardened responses "
+        "become hypersensitive.")
+
 
 DIFFERENTIABILITY_NOTE = (
     "All projections are C^inf in theta except: box/capsule primitives have "
