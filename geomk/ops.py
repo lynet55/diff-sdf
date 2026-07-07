@@ -26,7 +26,9 @@ from jax.scipy.special import logsumexp
 @dataclass(frozen=True)
 class OpSpec:
     kind: str
-    param_kinds: str          # one char per param: 'f' free, 'p' positive
+    param_kinds: object       # per-param kind chars ('f' free, 'p' positive):
+                              # a fixed str, or a callable(n_values) -> str for
+                              # variable-arity ops (polygon).
     fn: Callable
     metric: str               # clean | preserve | dirty | require_clean
 
@@ -62,6 +64,42 @@ def _capsule(p, q):
     return _safe_norm(ap - t[..., None] * ab) - r
 
 
+def _safe_sqrt(d):
+    """sqrt with a zero (not inf) gradient at d == 0 — the scalar analogue of
+    _safe_norm, for squared-distance fields (polygon)."""
+    pos = d > 0.0
+    return jnp.where(pos, jnp.sqrt(jnp.where(pos, d, 1.0)), 0.0)
+
+
+def _polygon(p, q):
+    """Exact 2D signed-distance field of a closed polygon in the (x, y) plane,
+    read as an infinite prism in z (z is ignored). Vertices are the node's
+    param slice, flattened (x0, y0, x1, y1, ...); any n >= 3, convex OR concave
+    (winding-number sign, so self-consistent for non-convex sketches).
+
+    This is the sketch-profile primitive: extrude(polygon) is the exact prism
+    SDF and revolve(polygon) the exact solid of revolution ('preserve' both),
+    so a sketched profile stays metric-clean and can be offset/shelled without
+    a redistance node. Exact distance = min over edges of the point-segment
+    distance; sign = parity of the QL winding test. Metric 'clean'.
+    """
+    V = q.reshape(-1, 2)                       # (n, 2) vertices
+    Vj = jnp.roll(V, 1, axis=0)                # previous vertex (edge Vj->Vi)
+    e = Vj - V                                 # (n, 2) edge vectors
+    P = p[..., :2]                             # (..., 2), z ignored
+    w = P[..., None, :] - V                    # (..., n, 2)
+    ee = jnp.sum(e * e, axis=-1)               # (n,)
+    t = jnp.clip(jnp.sum(w * e, axis=-1) / (ee + 1e-30), 0.0, 1.0)   # (..., n)
+    b = w - e * t[..., None]                   # (..., n, 2)
+    dsq = jnp.min(jnp.sum(b * b, axis=-1), axis=-1)                  # (...,)
+    c1 = P[..., None, 1] >= V[:, 1]
+    c2 = P[..., None, 1] < Vj[:, 1]
+    c3 = e[:, 0] * w[..., 1] > e[:, 1] * w[..., 0]
+    flip = (c1 & c2 & c3) | (~c1 & ~c2 & ~c3)                        # (..., n)
+    s = jnp.where(jnp.sum(flip, axis=-1) % 2 == 1, -1.0, 1.0)        # (...,)
+    return s * _safe_sqrt(dsq)
+
+
 def _lattice(p, q):
     """Infinite axis-aligned strut lattice: cell size c, strut radius t.
     Fold space into the unit cell and take the min distance to the three
@@ -94,6 +132,12 @@ def _smooth_union(child_vals, q):
 def _smooth_subtract(child_vals, q):
     a, b = child_vals
     return q[0] * jnp.logaddexp(a / q[0], -b / q[0])  # smax(a, -b)
+
+
+def _smooth_intersect(child_vals, q):
+    """Smooth intersection = smooth max of the children (the third boolean).
+    C-infinity, sign-correct for the intersected shape, metric dirty."""
+    return q[0] * logsumexp(jnp.stack(child_vals) / q[0], axis=0)
 
 
 # --- rigid transform (warp; metric preserved) -------------------------------
@@ -142,9 +186,13 @@ OPS = {
     "sphere": OpSpec("primitive", "fffp", _sphere, "clean"),
     "box": OpSpec("primitive", "fffppp", _box, "clean"),
     "capsule": OpSpec("primitive", "ffffffp", _capsule, "clean"),
+    # polygon: variable arity (2 free coords per vertex) -> param_kinds is a
+    # callable of the value count. Exact 2D SDF, metric clean.
+    "polygon": OpSpec("primitive", lambda n: "f" * n, _polygon, "clean"),
     "lattice": OpSpec("primitive", "pp", _lattice, "dirty"),
     "smooth_union": OpSpec("combine", "p", _smooth_union, "dirty"),
     "smooth_subtract": OpSpec("combine", "p", _smooth_subtract, "dirty"),
+    "smooth_intersect": OpSpec("combine", "p", _smooth_intersect, "dirty"),
     "rigid": OpSpec("warp", "ffffff", _rigid, "preserve"),
     "revolve": OpSpec("warp", "", _revolve, "preserve"),
     "offset": OpSpec("unary", "f", _offset, "require_clean"),

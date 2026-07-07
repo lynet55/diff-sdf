@@ -78,6 +78,31 @@ def _lattice(gb):
     return gb.lattice(0.8, 0.18)
 
 
+def _intersect(gb):
+    return gb.smooth_intersect(gb.sphere((-0.25, 0.0, 0.1), 0.6),
+                               gb.box((0.25, 0.0, 0.0), (0.5, 0.4, 0.35)),
+                               k=0.1)
+
+
+def _pentagon(t):
+    ang = np.pi / 2 + 2 * np.pi * np.arange(5) / 5
+    return [(0.9 * np.cos(a), 0.9 * np.sin(a)) for a in ang]
+
+
+def _polygon(gb):
+    return gb.polygon(_pentagon(gb))
+
+
+def _extrude_polygon(gb):
+    return gb.extrude(gb.polygon(_pentagon(gb)), 0.5)
+
+
+def _revolve_polygon(gb):
+    # off-axis quad profile -> revolved ring (all y > 0 so the axis stays clear)
+    return gb.revolve(gb.polygon([(-0.3, 0.4), (0.3, 0.4),
+                                  (0.3, 0.9), (-0.3, 0.9)]))
+
+
 def _shell_of_extrude(gb):
     # clean-preserving extrude feeds a require_clean op without redistance
     return gb.shell(gb.extrude(gb.sphere((0.0, 0.1, 0.2), 0.6), 0.5), 0.1)
@@ -99,6 +124,10 @@ CASES = {
     "loft": _loft,
     "lattice": _lattice,
     "shell_of_extrude": _shell_of_extrude,
+    "smooth_intersect": _intersect,
+    "polygon": _polygon,
+    "extrude_polygon": _extrude_polygon,
+    "revolve_polygon": _revolve_polygon,
 }
 
 

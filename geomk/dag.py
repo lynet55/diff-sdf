@@ -52,6 +52,8 @@ class GraphBuilder:
     def _add(self, op, children, values):
         spec = OPS[op]
         kinds = spec.param_kinds
+        if callable(kinds):                       # variable-arity op (polygon)
+            kinds = kinds(len(values))
         assert len(values) == len(kinds), f"{op}: expected {len(kinds)} params"
         p0 = len(self._theta0)
         for v, kind in zip(values, kinds):
@@ -75,12 +77,24 @@ class GraphBuilder:
     def capsule(self, a, b, radius):
         return self._add("capsule", (), [*a, *b, radius])
 
+    def polygon(self, vertices):
+        """Closed 2D sketch profile in the (x, y) plane (infinite prism in z).
+        `vertices`: sequence of (x, y), n >= 3, convex or concave. Exact 2D SDF
+        -> metric clean; feed to extrude/revolve/loft or offset/shell it."""
+        v = np.asarray(vertices, dtype=np.float64)
+        assert v.ndim == 2 and v.shape[1] == 2 and v.shape[0] >= 3, \
+            "polygon needs an (n>=3, 2) vertex array"
+        return self._add("polygon", (), v.reshape(-1).tolist())
+
     # booleans
     def smooth_union(self, *children, k=0.08):
         return self._add("smooth_union", children, [k])
 
     def smooth_subtract(self, a, b, k=0.08):
         return self._add("smooth_subtract", (a, b), [k])
+
+    def smooth_intersect(self, *children, k=0.08):
+        return self._add("smooth_intersect", children, [k])
 
     # transform
     def rigid(self, child, translation=(0.0, 0.0, 0.0), rotvec=(0.0, 0.0, 0.0)):
